@@ -1,16 +1,34 @@
-# -*- coding: utf-8 -*-
-
-
 import collections
 import numpy as np
 import jieba
 import gensim
+import time
+
+ns = 0
+hs = 1
+sg = 0
+CBOW = 1
+
+
+def count_time(output='train complete!'):
+    def wrap(train_func):
+        def wrap2(*args, **kwargs):
+            st = time.time()
+            r = train_func(*args, **kwargs)
+            et = time.time()
+            t = et - st
+            print(f'{output} time: {t}')
+            return r
+
+        return wrap2
+
+    return wrap
 
 
 class Word2vec(object):
     def __init__(self, train_file, window=5, min_reduce=1,
                  layer1_size=100, table_size=1e6, alpha=0.025, negative=5,
-                 model_mode=1, train_mode=1, classes=10, itera=5):
+                 model_mode=hs, train_mode=CBOW, classes=10, itera=5):
         """
         :param train_file: 训练文件路径
         :param window: n-gram的窗口值
@@ -19,12 +37,11 @@ class Word2vec(object):
         :param table_size: neg的大小
         :param alpha: 学习率
         :param negative:
-        :param model_mode: 1 -> CBOW, 0 -> skip_gram
-        :param train_mode: 1 -> hs, 0 -> neg
+        :param model_mode: 1 -> CBOW, 0 -> sg
+        :param train_mode: 1 -> hs, 0 -> ns
         :param classes: 聚类的簇的数量
         :param itera: 迭代次数
         """
-        self.train_file = train_file
         self.window = window
         self.min_reduce = min_reduce
         self.layer1_size = layer1_size
@@ -35,7 +52,7 @@ class Word2vec(object):
         self.train_mode = train_mode
         self.classes = classes
         self.itera = itera
-        self.ReadWord()
+        self.sentence = [line.replace('\n', '') for line in open(train_file, 'r', encoding='utf-8')]
         self.SortVocab()
         self.ReduceVocab()
         if self.train_mode:
@@ -55,31 +72,26 @@ class Word2vec(object):
                 self.skip_gram()
             print('第%d次迭代' % (i + 1))
 
-    # 读单词
-    def ReadWord(self):
-        self.sen = []
-        for line in open(self.train_file, 'r', encoding='utf-8'):
-            self.sen.append(line.replace('\n', ''))
-
-    # 按词频排序，制作字典
     def SortVocab(self):
+        """按词频排序，制作字典"""
         self.word_list = []
-        for line in self.sen:
+        for line in self.sentence:
             for word in jieba.cut(line):
                 if word.isalpha():
                     self.word_list.append(word)
         self.word_dict = collections.Counter(self.word_list)
 
-    # 低频词的处理
     def ReduceVocab(self):
+        """低频词的处理"""
         word_dict = self.word_dict.copy()
         for k in self.word_dict.keys():
             if self.word_dict[k] < self.min_reduce:
                 del word_dict[k]
         self.word_dict = word_dict
 
-    # 建立哈夫曼树
+    @count_time(output='CreateBinaryTree successful!')
     def CreateBinaryTree(self):
+        """建立哈夫曼树"""
         # 字典从大到小排序，以便创建哈夫曼树
         self.word_dict = sorted(self.word_dict.items(), key=lambda x: x[1], reverse=True)
         self.word = []
@@ -128,7 +140,7 @@ class Word2vec(object):
             # 次最小值即右孩子赋1
             binary[min2] = 1
         # 哈夫曼编码
-        self.codelen = ['' for _ in range(self.vocab_size)]  # 保存编码长度
+        self.codelen = [0 for _ in range(self.vocab_size)]  # 保存编码长度
         self.code = [[] for _ in range(self.vocab_size)]  # 保存哈夫曼编码
         self.point = [[] for _ in range(self.vocab_size)]  # 保存父节点
         for a in range(self.vocab_size):
@@ -142,8 +154,8 @@ class Word2vec(object):
             self.codelen[a] = i
             self.code[a] = self.code[a][::-1]
             self.point[a] = self.point[a][::-1]
-        print('CreateBinaryTree successful!')
 
+    @count_time(output='InitUnigramTable successful!')
     def InitUnigramTable(self):
         self.word = []
         self.cn = []
@@ -166,16 +178,18 @@ class Word2vec(object):
                 d1 += np.power(self.cn[i], power) / train_words_pow
             if i >= self.vocab_size:
                 i = self.vocab_size - 1
-        print('InitUnigramTable successful!')
 
+    @count_time(output='CBOW successful!')
     def CBOW(self):
+        """词袋模型，上下文预测当前单词"""
         for i, word in enumerate(self.word):
             # print(i,word)
-            neu1e = np.zeros((self.layer1_size))
-            # in -> hidden
-            # 对指定单词前后window个单词的权值进行更新，平均池化
-            b = np.random.randint(self.window)
-            for a in range(b, self.window * 2 + 1 + b):
+            neu1e = np.zeros(self.layer1_size)
+
+            # in layer -> hidden layer
+            # 对指定单词随机前后共window个单词的权值进行更新，平均池化
+            random_left = np.random.randint(self.window)
+            for a in range(random_left, self.window * 2 + 1 + random_left):
                 l1 = i - self.window + a
                 if l1 < 0:
                     continue
@@ -183,6 +197,7 @@ class Word2vec(object):
                     continue
                 for b in range(self.layer1_size):
                     self.neu1[b] += self.syn0[l1][b] / (self.window * 2 + 1)
+
             # 训练自身隐藏层结点权值、自身词向量更新系数
             if self.train_mode:
                 for d in range(self.codelen[i]):
@@ -245,8 +260,9 @@ class Word2vec(object):
                 for b in range(self.layer1_size):
                     self.syn0[l1][b] += neu1e[b]
 
-    # TODO 耗时长
+    @count_time(output='skip_gram successful!')
     def skip_gram(self):
+        """TODO 耗时长"""
         for i, word in enumerate(self.word):
             # print(i,word)
             neu1e = np.zeros((self.layer1_size))

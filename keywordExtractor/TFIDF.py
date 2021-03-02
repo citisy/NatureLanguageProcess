@@ -23,7 +23,7 @@ class TFIDF:
 
         for line in cut_corpus:
             for word in set(line):
-                if word >= word_len:
+                if len(word) >= word_len:
                     word_idf[word] = word_idf.get(word, 0) + 1  # 统计每个文档某个词是否出现
 
         for k, v in word_idf.items():
@@ -101,7 +101,7 @@ def sklearn_tfidf():
     from sklearn.feature_extraction.text import CountVectorizer
     from sklearn.feature_extraction.text import TfidfTransformer
 
-    with open('../data/corpus_after_cut.txt', 'r', encoding='utf8') as f:
+    with open('../data/peoples_daily_word_cut.txt', 'r', encoding='utf8') as f:
         cut_corpus = [line for line in f.read().split('\n')]
 
     vec = CountVectorizer()
@@ -113,10 +113,10 @@ def sklearn_tfidf():
     print(feature.toarray())
 
 
-def jieba_extract_keyword():
+def jieba_tfidf_extract_keyword():
     from jieba.analyse import extract_tags
 
-    with open('../data/corpus_after_cut.txt', 'r', encoding='utf8') as f:
+    with open('../data/peoples_daily_word_cut.txt', 'r', encoding='utf8') as f:
         original_corpus = f.read().replace(' ', '')
 
     keywords = extract_tags(original_corpus, topK=10)
@@ -126,7 +126,7 @@ def jieba_extract_keyword():
 if __name__ == '__main__':
     model = TFIDF()
 
-    with open('../data/corpus_after_cut.txt', 'r', encoding='utf8') as f:
+    with open('../data/peoples_daily_word_cut.txt', 'r', encoding='utf8') as f:
         cut_corpus = [line.split(' ') for line in f.read().split('\n')]
 
     # feature_list = model.get_feature_list(cut_corpus)
@@ -137,4 +137,4 @@ if __name__ == '__main__':
     keywords = model.extract_keyword(cut_corpus)
     print(keywords)
 
-    jieba_extract_keyword()
+    jieba_tfidf_extract_keyword()

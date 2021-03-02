@@ -6,27 +6,27 @@ import utils
 
 
 class HMM(object):
-    def __init__(self, state_list=None):
-        self.state_list = state_list or list('bmes')
+    def __init__(self, states=None):
+        self.states = states or list('bmes')
 
-        # eg: {'b': start_b}, start prob of pi('b')
-        self.pi = {k: 0 for k in self.state_list}
+        # 初始概率，eg: {states: start_prob}
+        self.pi = {k: 0 for k in self.states}
 
-        # eg: {'b':{'m':trans_b}}, trans prob of a('m'|'b')
-        self.a = {k0: {k1: 0 for k1 in self.state_list}
-                  for k0 in self.state_list}
+        # 转移概率，eg: {states: {states: trans_prob}}
+        self.a = {k0: {k1: 0 for k1 in self.states}
+                  for k0 in self.states}
 
-        # eg: {'b': {word: emit_b}}, emit prob of b(word|'b')
-        self.b = {k: {} for k in self.state_list}
+        # 状态概率，eg: {states: {obs: emit_prob}}
+        self.b = {k: {} for k in self.states}
 
-        # eg: {'b': num} num of 'b' in all state
-        self.count = {k: 0 for k in self.state_list}
+        # 每个状态出现的次数，eg: {states: num_states}
+        self.count = {k: 0 for k in self.states}
 
         self.char2state = None
         self.default = -1e9  # 不可能存在的情况的默认对数概率值
 
     def base_cut(self, fpath=None, char_list=None, state_list=None):
-        """input data is entire sentences, we can count all trans probs according to inputs
+        """基于完整文本的训练
         char_list: sentence which is cut into chars, eg: [[char_1, char_2...], ..., [char_n1, char_n2...]]
         state: state of each sen each char, eg: [[b, m, ...], ..., [s, s, ...]]
         """
@@ -73,8 +73,8 @@ class HMM(object):
                     self.b[k0][k1] = self.default
 
     def base_dict(self, fpath):
-        """input data is a dict of words and counts, we can't get a whole trans probs according to inputs,
-        so we need to assume some trans probs:
+        """基于词频字典的训练
+        we need to assume some trans probs:
             we have no trans of 'ss', 'sb', 'es', 'eb',
             but in fact, we can assume that all sens are made up of random words, and each contexts are independence,
             so the trans of each tags are also independence.
@@ -135,7 +135,7 @@ class HMM(object):
         input: b_dic = {state: word}
         output: char2state = {word: state}
         """
-        default = {k: self.default for k in self.state_list}
+        default = {k: self.default for k in self.states}
         char2state = {}
         for i, j in self.b.items():
             for k in j:
@@ -171,7 +171,7 @@ class HMM(object):
         # 为了方便查询，对 b_dic 进行转置操作
         char2state = self.get_char2state()
 
-        default = {k: self.default for k in self.state_list}
+        default = {k: self.default for k in self.states}
 
         # 后面会重复用到b_i的值，为了减少重复查询，这里预先查询保存
         nodes = [char2state.get(i, default) for i in text]
