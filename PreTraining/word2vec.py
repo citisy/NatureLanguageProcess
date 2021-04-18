@@ -1,20 +1,8 @@
-"""# word2vec
-源码地址：https://github.com/tmikolov/word2vec/blob/master/word2vec.c<br>
-
-其他博客：<br>
-源码理解：<br>
-https://blog.csdn.net/u012180351/article/details/76682634<br>
-https://blog.csdn.net/cnki_ok/article/details/41719401<br>
-https://blog.csdn.net/juanjuan1314/article/details/52106565<br>
-word2vec模型理解：<br>
-http://www.hankcs.com/nlp/word2vec.html<br>
-http://www.cnblogs.com/pinard/p/7160330.html<br>"""
-
 import collections
 import numpy as np
-import jieba
-import gensim
-import time
+from utils import *
+from tqdm import tqdm
+import json
 
 ns = 0
 hs = 1
@@ -22,40 +10,24 @@ sg = 0
 CBOW = 1
 
 
-def count_time(output='train complete!'):
-    def wrap(train_func):
-        def wrap2(*args, **kwargs):
-            st = time.time()
-            r = train_func(*args, **kwargs)
-            et = time.time()
-            t = et - st
-            print(f'{output} time: {t}')
-            return r
-
-        return wrap2
-
-    return wrap
-
-
 class Word2vec(object):
-    def __init__(self, train_file, window=5, min_reduce=1,
+    def __init__(self, sentences=None, window=5, min_reduce=5, max_reduce=0.01,
                  layer1_size=100, table_size=1e6, alpha=0.025, negative=5,
                  model_mode=hs, train_mode=CBOW, classes=10, itera=5):
         """
-        :param train_file: 训练文件路径
+        :param sentences: 输入单词序列，iterable of iterables
         :param window: n-gram的窗口值
         :param min_reduce: 舍弃词频小于指定值的单词
         :param layer1_size: hs的大小
         :param table_size: neg的大小
         :param alpha: 学习率
-        :param negative:
+        :param negative: 负采样样本数
         :param model_mode: 1 -> CBOW, 0 -> sg
         :param train_mode: 1 -> hs, 0 -> ns
         :param classes: 聚类的簇的数量
         :param itera: 迭代次数
         """
         self.window = window
-        self.min_reduce = min_reduce
         self.layer1_size = layer1_size
         self.table_size = int(table_size)
         self.alpha = alpha
@@ -64,67 +36,99 @@ class Word2vec(object):
         self.train_mode = train_mode
         self.classes = classes
         self.itera = itera
-        self.sentence = [line.replace('\n', '') for line in open(train_file, 'r', encoding='utf-8')]
-        self.SortVocab()
-        self.ReduceVocab()
+        self.sentence = sentences
+        self.min_reduce = min_reduce
+        self.max_reduce = max_reduce
+
+    def train(self):
+        # 按词频排序，制作字典
+        word_list = []
+        for line in self.sentence:
+            word_list += line
+        self.word_index = collections.Counter(word_list)
+
+        # 过滤低频词
+        self.word_index = {k: v for k, v in self.word_index.items() if v >= self.min_reduce}
+
+        # 过滤高频词
+        word_index = dict()
+        d = len(word_list)
+        for k, v in self.word_index.items():
+            fre = v / d
+            if fre >= self.max_reduce:
+                prob = 1 - np.sqrt(self.max_reduce / fre)
+                ran = np.random.random()
+                if prob > ran:
+                    word_index[k] = v
+            else:
+                word_index[k] = v
+
+        self.word_index = word_index
+
+        self.sigmoid_table = 1.0 / (1.0 + np.exp(-np.arange(-6, 6, 0.01)))  # 快速sigmoid表
+
         if self.train_mode:
-            self.CreateBinaryTree()
+            self.create_binary_tree()
         else:
-            self.InitUnigramTable()
+            self.init_unigram_table()
+
+        # 将单词序列转为索引序列
+        self.sentence_index = [[self.word_index.get(word, -1) for word in line] for line in self.sentence]
+
+        self.vocab_size = len(self.word_index)
+
         # 随机初始化词向量，矩阵大小 => [vocab_size, layer1_size]
-        self.syn0 = np.random.random((self.vocab_size, self.layer1_size))
-        # 初始化权重矩阵
-        self.syn1 = np.zeros((self.vocab_size, self.layer1_size))
-        # 词向量矩阵和
-        self.neu1 = np.zeros((self.layer1_size))
+        self.h = np.random.random((self.vocab_size, self.layer1_size))
+
+        # 初始化辅助权重矩阵
+        # 在hs中表示每个节点的权值，在ns中表示隐藏层到输出层的权值
+        self.v = np.zeros((self.vocab_size, self.layer1_size))
+
         for i in range(self.itera):
             if self.model_mode:
                 self.CBOW()
             else:
                 self.skip_gram()
-            print('第%d次迭代' % (i + 1))
 
-    def SortVocab(self):
-        """按词频排序，制作字典"""
-        self.word_list = []
-        for line in self.sentence:
-            for word in jieba.cut(line):
-                if word.isalpha():
-                    self.word_list.append(word)
-        self.word_dict = collections.Counter(self.word_list)
+        self.index_word = {v: k for k, v in self.word_index.items()}
 
-    def ReduceVocab(self):
-        """低频词的处理"""
-        word_dict = self.word_dict.copy()
-        for k in self.word_dict.keys():
-            if self.word_dict[k] < self.min_reduce:
-                del word_dict[k]
-        self.word_dict = word_dict
+    def fast_sigmoid(self, x):
+        """通过查表近似计算sigmoid函数"""
+        if x < -6:
+            return 0
+        if x > 6:
+            return 1
+        return self.sigmoid_table[int((x + 6) / 0.01)]
 
     @count_time(output='CreateBinaryTree successful!')
-    def CreateBinaryTree(self):
+    def create_binary_tree(self):
         """建立哈夫曼树"""
         # 字典从大到小排序，以便创建哈夫曼树
-        self.word_dict = sorted(self.word_dict.items(), key=lambda x: x[1], reverse=True)
-        self.word = []
-        self.cn = []
-        for (k, v) in self.word_dict:
-            self.word.append(k)
-            self.cn.append(v)
-        self.vocab_size = len(self.word)
+        word_count = sorted(self.word_index.items(), key=lambda x: x[1], reverse=True)
+        word_index = dict()  # 按照词频编码
+        cn = []
+
+        for k, v in word_count:
+            word_index[k] = len(word_index)
+            cn.append(v)
+
+        vocab_size = len(word_index)
+
         # 哈夫曼树用数组形式表示，[:vocab_size]保存单词，[vocab_size:]保存父节点
-        # 从vocab_size开始查找，因为已经按词频排序，所以从中间相两边比较即可创建哈夫曼树
-        pos1 = self.vocab_size - 1
-        pos2 = self.vocab_size
-        # 源码矩阵大小为2*vocab_size+1，存疑
-        count = [-1 for _ in range(2 * self.vocab_size - 1)]  # 保存结点的值
-        count[:self.vocab_size] = self.cn
-        count[self.vocab_size:] = [1e15 for _ in range(self.vocab_size - 1)]
-        parent_node = ['' for _ in range(2 * self.vocab_size - 2)]  # 保存父节点的下标
-        binary = [0 for _ in range(2 * self.vocab_size - 1)]  # 保存编码
-        # 哈夫曼树的总结点数为2*vocab_size-1
-        for a in range(self.vocab_size - 1):
-            # 最小值和次最小值
+        # 作者源码中，矩阵大小为 2*vocab_size+1，但后续操作中，矩阵的最后2位貌似并未被使用，暂未知为什么要多出2位
+        count = np.zeros(2 * vocab_size - 1, dtype=int)  # 保存结点的值
+        count[:vocab_size] = cn
+        count[vocab_size:] = 1e15
+
+        parent_node = ['' for _ in range(2 * vocab_size - 2)]  # 保存父节点的下标
+        binary = [0 for _ in range(2 * vocab_size - 1)]  # 保存编码
+
+        # 从vocab_size开始查找，因为已经按词频排序，所以从中间向两边比较即可创建哈夫曼树
+        pos1 = vocab_size - 1
+        pos2 = vocab_size
+
+        for a in range(vocab_size - 1):  # 哈夫曼树的总结点数为2*vocab_size-1
+            # 最小值
             if pos1 >= 0:
                 if count[pos1] < count[pos2]:
                     min1 = pos1
@@ -135,6 +139,8 @@ class Word2vec(object):
             else:
                 min1 = pos2
                 pos2 += 1
+
+            # 次最小值
             if pos1 >= 0:
                 if count[pos1] < count[pos2]:
                     min2 = pos1
@@ -145,226 +151,292 @@ class Word2vec(object):
             else:
                 min2 = pos2
                 pos2 += 1
+
             # 从vocab_size开始依次保存父节点的值
-            count[self.vocab_size + a] = count[min1] + count[min2]
-            parent_node[min1] = self.vocab_size + a
-            parent_node[min2] = self.vocab_size + a
+            count[vocab_size + a] = count[min1] + count[min2]
+            parent_node[min1] = vocab_size + a
+            parent_node[min2] = vocab_size + a
             # 次最小值即右孩子赋1
             binary[min2] = 1
+
         # 哈夫曼编码
-        self.codelen = [0 for _ in range(self.vocab_size)]  # 保存编码长度
-        self.code = [[] for _ in range(self.vocab_size)]  # 保存哈夫曼编码
-        self.point = [[] for _ in range(self.vocab_size)]  # 保存父节点
-        for a in range(self.vocab_size):
+        self.codelen = [0 for _ in range(vocab_size)]  # 保存编码长度
+        self.code = [[] for _ in range(vocab_size)]  # 保存哈夫曼编码
+        self.point = [[] for _ in range(vocab_size)]  # 保存节点序号
+
+        for a in range(vocab_size):
             b = a
             i = 0
-            while b < self.vocab_size * 2 - 2:
+            while b < vocab_size * 2 - 2:
                 self.code[a].append(binary[b])
-                self.point[a].append(b - self.vocab_size)
+                self.point[a].append(b - vocab_size)
                 i += 1
                 b = parent_node[b]
+
             self.codelen[a] = i
             self.code[a] = self.code[a][::-1]
             self.point[a] = self.point[a][::-1]
 
+        # 返回传值
+        self.word_index = word_index
+
     @count_time(output='InitUnigramTable successful!')
-    def InitUnigramTable(self):
-        self.word = []
-        self.cn = []
-        for (k, v) in self.word_dict.items():
-            self.word.append(k)
-            self.cn.append(v)
-        self.vocab_size = len(self.word)
+    def init_unigram_table(self):
+        word_index = dict()  # 按照词频编码
+        cn = []
+
+        for k, v in self.word_index.items():
+            word_index[k] = len(word_index)
+            cn.append(v)
+
+        vocab_size = len(word_index)
         power = 0.75
-        self.table = np.zeros(self.table_size, dtype=np.int64)
+        table = np.zeros(self.table_size, dtype=int)
         train_words_pow = 0
-        for a in range(self.vocab_size):
-            train_words_pow += np.power(self.cn[a], power)
+
+        for a in range(vocab_size):
+            train_words_pow += np.power(cn[a], power)
+
         i = 0  # 单词下标
-        d1 = np.power(self.cn[i], power)
+        d1 = np.power(cn[i], power)
+
         for a in range(self.table_size):
-            self.table[a] = i
+            table[a] = i
+
             # 把table按词频划分，词频越高，占table的位置越多
             if a / self.table_size > d1:
                 i += 1
-                d1 += np.power(self.cn[i], power) / train_words_pow
-            if i >= self.vocab_size:
-                i = self.vocab_size - 1
+                d1 += np.power(cn[i], power) / train_words_pow
 
-    @count_time(output='CBOW successful!')
+            if i >= vocab_size:
+                i = vocab_size - 1
+
+        # 返回传值
+        self.word_index = word_index
+        self.cn = cn
+        self.table = table
+
     def CBOW(self):
         """词袋模型，上下文预测当前单词"""
-        for i, word in enumerate(self.word):
-            # print(i,word)
-            neu1e = np.zeros(self.layer1_size)
-
-            # in layer -> hidden layer
-            # 对指定单词随机前后共window个单词的权值进行更新，平均池化
-            random_left = np.random.randint(self.window)
-            for a in range(random_left, self.window * 2 + 1 + random_left):
-                l1 = i - self.window + a
-                if l1 < 0:
+        for line in tqdm(self.sentence_index):
+            for a, i in enumerate(line):
+                # 低频词不训练
+                if i == -1:
                     continue
-                if l1 >= self.vocab_size:
-                    continue
-                for b in range(self.layer1_size):
-                    self.neu1[b] += self.syn0[l1][b] / (self.window * 2 + 1)
 
-            # 训练自身隐藏层结点权值、自身词向量更新系数
-            if self.train_mode:
-                for d in range(self.codelen[i]):
-                    f = 0
-                    # 路径上的点的序号
-                    l2 = self.point[i][d]
-                    # 小于0为叶结点，即单词自身，不迭代
-                    if l2 < 0:
+                neu1e = np.zeros(self.layer1_size)
+
+                # in layer -> hidden layer
+                # 对指定单词随机前后共window个单词的权值进行更新，平均池化
+                random_left = np.random.randint(self.window)
+                l = a - random_left if a > random_left else 0
+                r = a - random_left + self.window
+                r = r if r < len(line) else len(line)
+
+                idx = []
+                for j in range(l, r):
+                    if i == j:
                         continue
-                    # 计算f
-                    for b in range(self.layer1_size):
-                        f += self.neu1[b] * self.syn1[l2][b]
-                    # sigmoid function
-                    f = 1.0 / (1.0 + np.exp(-f))
-                    # 计算学习率
-                    g = (1 - self.code[i][d] - f) * self.alpha
-                    # 记录累积误差项
-                    for b in range(self.layer1_size):
-                        neu1e[b] += g * self.syn1[l2][b]
-                    # 更新非叶结点权重
-                    for b in range(self.layer1_size):
-                        self.syn1[l2][b] += g * self.neu1[b]
-            else:
-                # 随机采个数最多为negative的负样本
-                for d in range(self.negative + 1):
-                    # 第一个采样该单词，为正样本，其余采样为负样本
-                    if d == 0:
-                        l2 = i
-                        label = 1
-                    else:
-                        rand = np.random.randint(self.table_size)
-                        l2 = self.table[rand]
-                        # 若采样落在该单词占有的区域，则跳过
-                        # 词频越高，跳过几率越大，最终采到的样本越少
-                        if l2 == i:
-                            continue
-                        label = 0
-                    f = 0
-                    # 计算f
-                    for b in range(self.layer1_size):
-                        f += self.neu1[b] * self.syn1[l2][b]
-                    # sigmoid function
-                    f = 1.0 / (1.0 + np.exp(-f))
-                    # 计算学习率
-                    g = (label - f) * self.alpha
-                    # 记录累积误差项
-                    for b in range(self.layer1_size):
-                        neu1e[b] += g * self.syn1[l2][b]
-                    # 更新非叶结点权重
-                    for b in range(self.layer1_size):
-                        self.syn1[l2][b] += g * self.neu1[b]
-            # hidden -> in
-            # 更新词向量，把选中的训练好的词向量系数加到其他词的向量上
-            for a in range(self.window * 2 + 1):
-                l1 = i - self.window + a
-                if l1 < 0:
-                    continue
-                if l1 >= self.vocab_size:
-                    continue
-                for b in range(self.layer1_size):
-                    self.syn0[l1][b] += neu1e[b]
+                    if line[j] == -1:
+                        continue
 
-    @count_time(output='skip_gram successful!')
-    def skip_gram(self):
-        """TODO 耗时长"""
-        for i, word in enumerate(self.word):
-            # print(i,word)
-            neu1e = np.zeros((self.layer1_size))
-            b = np.random.randint(self.window)
-            for a in range(b, 2 * self.window + 1 + b):
-                l1 = i - self.window + a
-                if l1 < 0:
+                    idx.append(line[j])
+
+                if not idx:
                     continue
-                if l1 >= self.vocab_size:
-                    continue
-                if self.train_mode:
+
+                x = np.sum(self.h[idx], axis=0) / len(idx)
+
+                # 训练自身隐藏层结点权值、自身词向量更新系数
+                if self.train_mode:  # HS
                     for d in range(self.codelen[i]):
-                        f = 0
-                        l2 = self.point[i][d]
-                        if l2 < 0:
+                        point = self.point[i][d]  # 路径上的点的序号
+
+                        if point < 0:  # 小于0为叶结点，即单词自身，不迭代
                             continue
-                        # hidden -> out
-                        for b in range(self.layer1_size):
-                            f += self.syn0[l1][b] * self.syn1[l2][b]
-                        # sigmoid function
-                        f = 1.0 / (1.0 + np.exp(-f))
-                        # 计算学习率
+
+                        # 计算f
+                        f = x @ self.v[point].T
+                        f = self.fast_sigmoid(f)
+
                         g = (1 - self.code[i][d] - f) * self.alpha
+
                         # 记录累积误差项
-                        for b in range(self.layer1_size):
-                            neu1e[b] += g * self.syn1[l2][b]
+                        neu1e += g * self.v[point]
+
                         # 更新非叶结点权重
-                        for b in range(self.layer1_size):
-                            self.syn1[l2][b] += g * self.syn0[l1][b]
-                else:
+                        self.v[point] += g * x
+
+                else:  # NS
+                    # 随机采个数最多为negative的负样本
                     for d in range(self.negative + 1):
                         # 第一个采样该单词，为正样本，其余采样为负样本
                         if d == 0:
-                            l2 = i
+                            collection_word_index = i
                             label = 1
                         else:
                             rand = np.random.randint(self.table_size)
-                            l2 = self.table[rand]
+                            collection_word_index = self.table[rand]
+
                             # 若采样落在该单词占有的区域，则跳过
                             # 词频越高，跳过几率越大，最终采到的样本越少
-                            if l2 == i:
+                            if collection_word_index == i:
                                 continue
-                            label = 0
-                        f = 0
-                        # hidden -> out
-                        for b in range(self.layer1_size):
-                            f += self.syn0[l1][b] * self.syn1[l2][b]
-                        # sigmoid function
-                        f = 1.0 / (1.0 + np.exp(-f))
-                        # 计算下降梯度
-                        g = (label - f) * self.alpha
-                        # 记录累积误差项
-                        for b in range(self.layer1_size):
-                            neu1e[b] += g * self.syn1[l2][b]
-                        # 更新非叶结点权重
-                        for b in range(self.layer1_size):
-                            self.syn1[l2][b] += g * self.syn0[l1][b]
-                # in -> hidden
-                # 把其他词训练好的误差向量加到选中词的向量上
-                for b in range(self.layer1_size):
-                    self.syn0[l1][b] += neu1e[b]
-        del self.table
 
-    def kmeans(self):
-        pass
+                            label = 0
+
+                        # 计算f
+                        f = np.sum(x * self.v[collection_word_index])
+                        f = self.fast_sigmoid(f)
+
+                        g = (label - f) * self.alpha  # 计算学习率
+
+                        # 记录累积误差项
+                        neu1e += g * self.v[collection_word_index]
+
+                        # 更新非叶结点权重
+                        self.v[collection_word_index] += g * x
+
+                # hidden -> in
+                # 更新词向量，把其他词训练好的误差向量加到选中词的向量上
+                self.h[i] += neu1e / len(idx)
+
+    def skip_gram(self):
+        for line in tqdm(self.sentence_index):
+            for a, i in enumerate(line):
+                x = self.h[i]
+                neu1e = np.zeros(self.layer1_size)
+
+                random_left = np.random.randint(self.window)
+                l = a - random_left if a > random_left else 0
+                r = a - random_left + self.window
+                r = r if r < len(line) else len(line)
+
+                for j in range(l, r):
+                    if self.train_mode:  # HS
+                        for d in range(self.codelen[i]):
+                            point = self.point[i][d]
+                            if point < 0:
+                                continue
+
+                            # hidden -> out
+                            f = self.h[line[j]] @ self.v[point].T
+                            f = self.fast_sigmoid(f)
+
+                            g = (1 - self.code[i][d] - f) * self.alpha
+
+                            # 记录累积误差项
+                            neu1e += g * self.v[point]
+
+                            # 更新非叶结点权重
+                            self.v[point] += g * x
+
+                    else:  # NS
+                        for d in range(self.negative + 1):
+                            # 第一个采样该单词，为正样本，其余采样为负样本
+                            if d == 0:
+                                collection_word_index = i
+                                label = 1
+                            else:
+                                rand = np.random.randint(self.table_size)
+                                collection_word_index = self.table[rand]
+
+                                # 若采样落在该单词占有的区域，则跳过
+                                # 词频越高，跳过几率越大，最终采到的样本越少
+                                if collection_word_index == i:
+                                    continue
+
+                                label = 0
+
+                            # hidden -> out
+                            f = np.sum(self.h[line[j]] * self.v[collection_word_index])
+                            f = self.fast_sigmoid(f)
+
+                            # 计算下降梯度
+                            g = (label - f) * self.alpha
+
+                            # 记录累积误差项
+                            neu1e += g * self.v[collection_word_index]
+
+                            self.v[collection_word_index] += g * x
+
+                    # in -> hidden
+                    # 把选中词的向量加到其他词训练好的误差向量上
+                    self.h[j] += neu1e
+
+    def save(self, save_path):
+        np.save(save_path, self.h)
+
+        with open(save_path + '.json', 'w', encoding='utf8') as f:
+            json.dump(self.word_index, f, indent=4, ensure_ascii=False)
+
+    def load(self, save_path):
+        self.h = np.load(save_path + '.npy')
+
+        with open(save_path + '.json', 'r', encoding='utf8') as f:
+            self.word_index = json.load(f)
+
+        self.index_word = {v: k for k, v in self.word_index.items()}
+
+        self.vocab_size = len(self.word_index)
 
     def most_similar(self, s, cn=10):
-        ind = self.word.index(s)
-        sim = []
-        for i in range(self.vocab_size):
-            sim.append(np.dot(self.syn0[ind], self.syn0[i]))
-        sim_ = sim.copy()
-        sim_.sort()
-        similar = []
-        for i in range(cn):
-            ind = sim.index(sim_[i])
-            similar.append(self.word[ind])
-        return similar
+        """余弦相似度判断相近词"""
+        if s not in self.word_index:
+            raise ValueError(f'The word {s} not in dict!')
 
-    # 求词的模
-    def value(self, s):
-        ind = self.word.index(s)
-        return np.sqrt((self.syn0[ind] ** 2).sum())
+        idx = self.word_index[s]
+        sim = np.zeros(self.vocab_size)
+
+        a = self.h[idx]
+        for i in range(self.vocab_size):
+            b = self.h[i]
+            sim[i] = a @ b.T / (np.linalg.norm(a) * np.linalg.norm(b))
+
+        arg_sort = np.argsort(sim)[::-1]
+
+        return [(self.index_word[arg_sort[i + 1]], sim[arg_sort[i + 1]]) for i in range(cn)]
+
+
+def my_model():
+    save_path = 'saver/2014_corpus_my_word2vec_cbow_hs.model'
+
+    # fpath = '../data/2014_corpus_cut.txt'
+    # char_list = read_word_cut_file(fpath)
+    # model = Word2vec(char_list, model_mode=CBOW, train_mode=hs, itera=3)
+    # model.train()
+    # model.save(save_path)
+
+    model = Word2vec()
+    model.load(save_path)
+
+    print(model.most_similar('计算机', 10))
+
+
+def gensim_model():
+    import gensim
+
+    class MyCallback(gensim.models.callbacks.CallbackAny2Vec):
+        epoch = 1
+
+        def on_epoch_end(self, model):
+            print(f'The {self.epoch}th epoch end!')
+            self.epoch += 1
+
+    save_path = 'saver/2014_corpus_word2vec_cbow_hs.model'
+    # fpath = '../data/2014_corpus_cut.txt'
+    # char_list = read_word_cut_file(fpath)
+    #
+    # model = gensim.models.Word2Vec(char_list, min_count=5, size=200, sg=0, hs=1,
+    #                                callbacks=[MyCallback()])
+    # model.callbacks = ()  # 需要清空回调函数，否则保存会报错！
+    # model.save(save_path)
+
+    model = gensim.models.Word2Vec.load(save_path)
+
+    print(model.most_similar('计算机'))
 
 
 if __name__ == '__main__':
-    filename = './data/Q.txt'
-    word2vec = Word2vec(filename, model_mode=1, train_mode=1, itera=5)
-    # print(word2vec.value('计算机'))
-    print(word2vec.most_similar('笔记本', 10))
-    sen = [word2vec.word_list, []]
-    model = gensim.models.Word2Vec(sen, min_count=1, size=200, hs=1, sg=0)
-    print(model.most_similar('笔记本'))
+    my_model()
+    # gensim_model()

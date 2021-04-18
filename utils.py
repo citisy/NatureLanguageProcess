@@ -1,6 +1,23 @@
 import re
+import time
 
 
+def count_time(output='Train complete!'):
+    def wrap(train_func):
+        def wrap2(*args, **kwargs):
+            st = time.time()
+            r = train_func(*args, **kwargs)
+            et = time.time()
+            t = et - st
+            print(f'{output} Use time: {t}!')
+            return r
+
+        return wrap2
+
+    return wrap
+
+
+@count_time('Load file complete!')
 def read_word_cut_file(fp, line_break='\n', word_break=' '):
     """读取标准格式的分词文本
 
@@ -16,6 +33,7 @@ def read_word_cut_file(fp, line_break='\n', word_break=' '):
     return cut_corpus
 
 
+@count_time('Load file complete!')
 def read_word_tag_file(fp, line_break='\n', word_break=' '):
     """读取标准格式的已打标的分词文本
 
