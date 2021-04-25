@@ -11,9 +11,9 @@ CBOW = 1
 
 
 class Word2vec(object):
-    def __init__(self, sentences=None, window=5, min_reduce=5, max_reduce=0.01,
+    def __init__(self, sentences=None, window=5, min_reduce=5, max_reduce=0.005,
                  layer1_size=100, table_size=1e6, alpha=0.025, negative=5,
-                 model_mode=hs, train_mode=CBOW, classes=10, itera=5):
+                 model_mode=hs, train_mode=CBOW, itera=5):
         """
         :param sentences: 输入单词序列，iterable of iterables
         :param window: n-gram的窗口值
@@ -24,7 +24,6 @@ class Word2vec(object):
         :param negative: 负采样样本数
         :param model_mode: 1 -> CBOW, 0 -> sg
         :param train_mode: 1 -> hs, 0 -> ns
-        :param classes: 聚类的簇的数量
         :param itera: 迭代次数
         """
         self.window = window
@@ -34,7 +33,6 @@ class Word2vec(object):
         self.negative = negative
         self.model_mode = model_mode
         self.train_mode = train_mode
-        self.classes = classes
         self.itera = itera
         self.sentence = sentences
         self.min_reduce = min_reduce
@@ -65,12 +63,14 @@ class Word2vec(object):
 
         self.word_index = word_index
 
-        self.sigmoid_table = 1.0 / (1.0 + np.exp(-np.arange(-6, 6, 0.01)))  # 快速sigmoid表
+        self.sigmoid_table = 1.0 / (1.0 + np.exp(-np.arange(-6, 6, 0.0001)))  # 快速sigmoid表
 
         if self.train_mode:
             self.create_binary_tree()
         else:
             self.init_unigram_table()
+
+        self.index_word = {v: k for k, v in self.word_index.items()}
 
         # 将单词序列转为索引序列
         self.sentence_index = [[self.word_index.get(word, -1) for word in line] for line in self.sentence]
@@ -78,7 +78,7 @@ class Word2vec(object):
         self.vocab_size = len(self.word_index)
 
         # 随机初始化词向量，矩阵大小 => [vocab_size, layer1_size]
-        self.h = np.random.random((self.vocab_size, self.layer1_size))
+        self.h = np.random.random((self.vocab_size, self.layer1_size)) * 2 - 1
 
         # 初始化辅助权重矩阵
         # 在hs中表示每个节点的权值，在ns中表示隐藏层到输出层的权值
@@ -90,15 +90,13 @@ class Word2vec(object):
             else:
                 self.skip_gram()
 
-        self.index_word = {v: k for k, v in self.word_index.items()}
-
     def fast_sigmoid(self, x):
         """通过查表近似计算sigmoid函数"""
         if x < -6:
             return 0
         if x > 6:
             return 1
-        return self.sigmoid_table[int((x + 6) / 0.01)]
+        return self.sigmoid_table[int((x + 6) / 0.0001)]
 
     @count_time(output='CreateBinaryTree successful!')
     def create_binary_tree(self):
@@ -182,10 +180,12 @@ class Word2vec(object):
 
     @count_time(output='InitUnigramTable successful!')
     def init_unigram_table(self):
-        word_index = dict()  # 按照词频编码
+        # 按照词频编码
+        word_count = sorted(self.word_index.items(), key=lambda x: x[1], reverse=True)
+        word_index = dict()
         cn = []
 
-        for k, v in self.word_index.items():
+        for k, v in word_count:
             word_index[k] = len(word_index)
             cn.append(v)
 
@@ -198,7 +198,7 @@ class Word2vec(object):
             train_words_pow += np.power(cn[a], power)
 
         i = 0  # 单词下标
-        d1 = np.power(cn[i], power)
+        d1 = np.power(cn[i], power) / train_words_pow
 
         for a in range(self.table_size):
             table[a] = i
@@ -213,12 +213,17 @@ class Word2vec(object):
 
         # 返回传值
         self.word_index = word_index
-        self.cn = cn
         self.table = table
 
     def CBOW(self):
         """词袋模型，上下文预测当前单词"""
-        for line in tqdm(self.sentence_index):
+        for aa, line in enumerate(tqdm(self.sentence_index)):
+            if aa % 10000 == 0:
+                self.alpha *= (1 - aa / len(self.sentence_index))
+
+                if self.alpha <= 10e-4:
+                    self.alpha = 10e-4
+
             for a, i in enumerate(line):
                 # 低频词不训练
                 if i == -1:
@@ -234,13 +239,13 @@ class Word2vec(object):
                 r = r if r < len(line) else len(line)
 
                 idx = []
-                for j in range(l, r):
-                    if i == j:
+                for b in range(l, r):
+                    if a == b:
                         continue
-                    if line[j] == -1:
+                    if line[b] == -1:
                         continue
 
-                    idx.append(line[j])
+                    idx.append(line[b])
 
                 if not idx:
                     continue
@@ -255,9 +260,7 @@ class Word2vec(object):
                         if point < 0:  # 小于0为叶结点，即单词自身，不迭代
                             continue
 
-                        # 计算f
-                        f = x @ self.v[point].T
-                        f = self.fast_sigmoid(f)
+                        f = self.fast_sigmoid(x @ self.v[point].T)
 
                         g = (1 - self.code[i][d] - f) * self.alpha
 
@@ -286,23 +289,29 @@ class Word2vec(object):
                             label = 0
 
                         # 计算f
-                        f = np.sum(x * self.v[collection_word_index])
-                        f = self.fast_sigmoid(f)
+                        f = self.fast_sigmoid(x @ self.v[collection_word_index].T)
 
                         g = (label - f) * self.alpha  # 计算学习率
 
                         # 记录累积误差项
                         neu1e += g * self.v[collection_word_index]
 
-                        # 更新非叶结点权重
+                        # 更新负样本权重
                         self.v[collection_word_index] += g * x
 
                 # hidden -> in
-                # 更新词向量，把其他词训练好的误差向量加到选中词的向量上
-                self.h[i] += neu1e / len(idx)
+                # 更新词向量，把误差向量加到上下文的向量上
+                self.h[idx] += neu1e / len(idx)
+
 
     def skip_gram(self):
-        for line in tqdm(self.sentence_index):
+        for aa, line in enumerate(tqdm(self.sentence_index)):
+            if aa % 10000 == 0:
+                self.alpha *= (1 - aa / len(self.sentence_index))
+
+                if self.alpha <= 10e-4:
+                    self.alpha = 10e-4
+
             for a, i in enumerate(line):
                 x = self.h[i]
                 neu1e = np.zeros(self.layer1_size)
@@ -312,7 +321,10 @@ class Word2vec(object):
                 r = a - random_left + self.window
                 r = r if r < len(line) else len(line)
 
-                for j in range(l, r):
+                for b in range(l, r):
+                    if a == b:
+                        continue
+
                     if self.train_mode:  # HS
                         for d in range(self.codelen[i]):
                             point = self.point[i][d]
@@ -320,7 +332,7 @@ class Word2vec(object):
                                 continue
 
                             # hidden -> out
-                            f = self.h[line[j]] @ self.v[point].T
+                            f = self.h[line[b]] @ self.v[point].T
                             f = self.fast_sigmoid(f)
 
                             g = (1 - self.code[i][d] - f) * self.alpha
@@ -349,7 +361,7 @@ class Word2vec(object):
                                 label = 0
 
                             # hidden -> out
-                            f = np.sum(self.h[line[j]] * self.v[collection_word_index])
+                            f = np.sum(self.h[line[b]] * self.v[collection_word_index])
                             f = self.fast_sigmoid(f)
 
                             # 计算下降梯度
@@ -361,8 +373,8 @@ class Word2vec(object):
                             self.v[collection_word_index] += g * x
 
                     # in -> hidden
-                    # 把选中词的向量加到其他词训练好的误差向量上
-                    self.h[j] += neu1e
+                    # 误差向量加到当前词的词向量上
+                    self.h[i] += neu1e
 
     def save(self, save_path):
         np.save(save_path, self.h)
@@ -399,16 +411,16 @@ class Word2vec(object):
 
 
 def my_model():
-    save_path = 'saver/2014_corpus_my_word2vec_cbow_hs.model'
+    save_path = 'saver/1998_corpus_my_word2vec_cbow_hs.model'
 
-    # fpath = '../data/2014_corpus_cut.txt'
-    # char_list = read_word_cut_file(fpath)
-    # model = Word2vec(char_list, model_mode=CBOW, train_mode=hs, itera=3)
-    # model.train()
-    # model.save(save_path)
+    fpath = '../data/1998_corpus_cut.txt'
+    char_list = read_word_cut_file(fpath)
+    model = Word2vec(char_list, model_mode=CBOW, train_mode=ns, itera=1)
+    model.train()
+    model.save(save_path)
 
-    model = Word2vec()
-    model.load(save_path)
+    # model = Word2vec()
+    # model.load(save_path)
 
     print(model.most_similar('计算机', 10))
 
@@ -434,7 +446,7 @@ def gensim_model():
 
     model = gensim.models.Word2Vec.load(save_path)
 
-    print(model.most_similar('计算机'))
+    print(model.wv.most_similar('计算机'))
 
 
 if __name__ == '__main__':
